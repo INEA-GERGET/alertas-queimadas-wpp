@@ -18,18 +18,19 @@ Para usar o script é necessário ter uma chave de acesso, que deverá ser coloc
     MAP_KEY = 'your_map_key_here'  # Substitua pelo seu MAP_KEY real
 ```
 
+É necessário baixar o [Shapefile dos setores censiários do Rio de Janeiro (IBGE)](https://www.ibge.gov.br/geociencias/downloads-geociencias.html?caminho=organizacao_do_territorio/malhas_territoriais/malhas_de_setores_censitarios__divisoes_intramunicipais/censo_2022/setores/shp/UF) e adicionar a pasta (após extrair do .zip) ao diretório. 
+
 ### Sobre os arquivos
-Diretório Raiz:
 
-main.py: O script principal que consome a API da NASA, realiza as filtragens espaciais com o GeoPandas e constrói o texto do relatório.
+* **main.py**: O script principal que consome a API da NASA, realiza as filtragens espaciais com o GeoPandas e constrói o texto do relatório.
 
-zap.py: Módulo complementar de RPA (Robotic Process Automation) que simula o teclado/mouse para interagir com o WhatsApp Desktop e gerencia os logs do sistema.
+* **zap.py**: Módulo complementar de RPA (Robotic Process Automation) que simula o teclado/mouse para interagir com o WhatsApp Desktop e gerencia os logs do sistema.
 
-calor_fixo.xlsx: Planilha com as coordenadas (latitude e longitude) de indústrias e plantas operacionais. Focos detectados em um raio de até 1.5 km destas coordenadas serão desconsiderados por serem calor fixo industrial.
+* **calor_fixo.xlsx**: Planilha com as coordenadas (latitude e longitude) de indústrias e plantas operacionais. Focos detectados em um raio de até 1.5 km destas coordenadas serão desconsiderados por serem calor fixo industrial.
 
-RJ_setores_CD2022: Esta pasta deve conter o Shapefile oficial (RJ_setores_CD2022.shp e suas extensões) do IBGE. Ele é utilizado para o spatial join que identifica o Município, Bairro e Distrito de cada foco de calor.
+* **RJ_setores_CD2022**: Esta pasta deve conter o Shapefile oficial (RJ_setores_CD2022.shp e suas extensões) do IBGE. Ele é utilizado para o spatial join que identifica o Município, Bairro e Distrito de cada foco de calor.
 
-logs: Pasta criada automaticamente pelo sistema onde o arquivo execucao.log será armazenado e rotacionado (máximo de 3 arquivos de 5MB cada).
+* **logs**: Pasta criada automaticamente pelo sistema onde o arquivo execucao.log será armazenado e rotacionado (máximo de 3 arquivos de 5MB cada).
 
 ## Instalação
 
