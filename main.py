@@ -1,16 +1,50 @@
+"""
+Script principal, apenas este deve ser rodado.
+Ele baixa os dados mais recentes, faz os cruzamentos
+E envia as mensagens por whatsapp
+No fim dele, ao chamar a main você deve definir o horário de envio, sempre sequencial.
+"""
+
 from datetime import datetime, timedelta
-import shapely.geometry
 import pandas as pd
 import geopandas as gpd
 import time
 from geopy.distance import geodesic
-import random
+import configparser
 from zap import *
+import json
+import os
+import logging
 
+# Configura o sistema de logging para registrar informações e erros.
 setup_logging()
+
+# Define o caminho para o arquivo de configuração e o lê.
+config_path = os.path.join('config', "config.ini") # Caminho do arquivo de configuração
+config = configparser.ConfigParser() # Ler o arquivo de configuração
+config.read(config_path)
+
+#Carrega as variáveis sensiveis a partir do arquivo de configuração
+MAP_KEY = config["FIRMS"]["KEY"]
+TOKEN   = config["FIRMS"]["TOKEN"]
+GRUPO   = config["FIRMS"]["GRUPO"]
+
+#Define o dia de hoje
+hoje = time.strftime("%Y-%m-%d")
 
 # Função para verificar se um foco está próximo de alguma indústria
 def foco_em_industria(foco, industrias, raio_km=1.5):
+    """
+    Verifica se um foco de calor está a uma determinada distância (raio) de qualquer indústria.
+
+    Args:
+        foco (pd.Series): Uma linha de um DataFrame representando um foco de calor, com colunas 'latitude' e 'longitude'.
+        industrias (pd.DataFrame): Um DataFrame contendo informações das indústrias, incluindo 'latitude' e 'longitude'.
+        raio_km (float, optional): A distância máxima em quilômetros para considerar um foco como próximo a uma indústria. O padrão é 1.5.
+
+    Returns:
+        bool: True se o foco estiver dentro do raio de alguma indústria, False caso contrário.
+    """
     foco_coord = (foco['latitude'], foco['longitude'])
     for _, industria in industrias.iterrows():
         industria_coord = (industria['latitude'], industria['longitude'])
@@ -19,168 +53,322 @@ def foco_em_industria(foco, industrias, raio_km=1.5):
     return False
 
 def viirs_utc_to_brasilia(acq_date, acq_time):
-    # Garante que acq_time tenha 4 dígitos (ex: 332 → '0332')
-    time_str = f"{int(acq_time):04d}"
-    # Combina data e hora
-    datetime_utc = datetime.strptime(f"{acq_date} {time_str}", "%Y-%m-%d %H%M")
-    # Converte de UTC para BRT (UTC-3)
-    datetime_brt = datetime_utc - timedelta(hours=3)
-    datetime_brt = str(datetime_brt)[11:16]
-    return datetime_brt
+    """
+    Converte a data e hora de aquisição do VIIRS (em UTC) para o fuso horário de Brasília (BRT).
 
-def formatar_mensagem(mensagem):
+    Args:
+        acq_date (str): A data de aquisição no formato "YYYY-MM-DD".
+        acq_time (int ou str): A hora de aquisição no formato "HHMM".
+
+    Returns:
+        str: A hora convertida para o formato "HH:MM" no fuso horário de Brasília.
+    """
+    time_str = f"{int(acq_time):04d}" # Garante que acq_time tenha 4 dígitos (ex: 332 → '0332')
+    datetime_utc = datetime.strptime(f"{acq_date} {time_str}", "%Y-%m-%d %H%M") # Combina data e hora
+    datetime_brt = datetime_utc - timedelta(hours=3) # Converte de UTC para BRT (UTC-3)
+    datetime_brt_str = datetime_brt.strftime("%H:%M") # Formato HH:MM
+    return datetime_brt_str
+
+def monta_pontos_de_calor() -> gpd.GeoDataFrame:
+    """
+    Monta o GeoDataFrame com os pontos de calor que não estão em zonas industriais dentro do estado do Rio de Janeiro
+
+    Returns:
+        current_gdf (GeoDataFrame): GeoDataFrame que contém os pontos de calor que não estão nas zonas industriais dentro do estao do Rio de Janeiro
+    """
+
+    """ Seção de dados da FIRMS"""
+    url_status = f'https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY={MAP_KEY}'
+
+    # Verifica o status da chave da API e o número de transações.
     try:
-        pyautogui.hotkey('win', 'r')
-        time.sleep(1)
-        pyautogui.write('notepad')
-        time.sleep(1)
-        pyautogui.press('enter')
-        time.sleep(2)
-        for letra in mensagem:
-            pyautogui.write(letra)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.hotkey('ctrl', 'c')
-        pyautogui.hotkey('alt', 'F4')
-        pyautogui.hotkey('right')
-        pyautogui.hotkey('enter')
-        logging.info("Mensagem copiada com sucesso!")
+        df_status = pd.read_json(url_status, typ='series')
+        tcount = df_status.get('current_transactions', "N/A")
+        logging.info(f'Our current transaction count is {tcount}')
     except Exception as e:
-        logging.error(f"Erro ao formatar a mensagem: {e}")
+        logging.error(f"There is an issue with the query for transaction count: {url_status.replace(MAP_KEY,"CHAVE")}. Error: {e}")
 
-def hora_envio():
-    hora_atual = time.strftime("%H:%M")
-    hora_envio = '7:'
-    r1 = random.randint(0, 3)
-    r2 = random.randint(0, 9)
-    hora_envio = hora_envio + str(r1) + str(r2)
-    logging.info(f"Hora atual: {hora_atual}")
-    logging.info(f"Hora de envio: {hora_envio}")
-    while True:
-        if hora_atual == hora_envio:
-            logging.info("Hora de enviar a mensagem!")
-            break
+    # Define a área de interesse (bounding box) para o estado do Rio de Janeiro.
+    rio_bbox = "-45.4,-23.6,-40.9,-20.7"
+    dfs = []
+
+    try: # Aqui ele acessa os dados mais recentes do VIIRS
+        # URLs para baixar dados de focos de calor de diferentes fontes do FIRMS.
+        sources = {
+            "VIIRS_NOAA20_NRT": f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/VIIRS_NOAA20_NRT/{rio_bbox}/1',
+            "VIIRS_NOAA21_NRT": f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/VIIRS_NOAA21_NRT/{rio_bbox}/1',
+            "MODIS_NRT": f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/MODIS_NRT/{rio_bbox}/1',
+            "VIIRS_SNPP_NRT": f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/VIIRS_SNPP_NRT/{rio_bbox}/1'}
+
+        # Itera sobre as fontes, baixa os dados e os armazena em uma lista de DataFrames.
+        for source_name, csv_url in sources.items():
+            try:
+                df_source = pd.read_csv(csv_url)
+                if not df_source.empty:
+                    dfs.append(df_source)
+                logging.info(f"Dados de {source_name} carregados: {len(df_source)} registros.")
+            except Exception as e:
+                logging.warning(f"Falha ao carregar dados de {source_name} da URL {csv_url.replace(MAP_KEY,"CHAVE")}. Erro: {e}")
+        
+        # Concatena todos os DataFrames em um único.
+        if not dfs:
+            logging.info("Nenhum dado de foco de calor foi carregado das fontes FIRMS.")
+            rio_df = pd.DataFrame()
         else:
-            logging.info(f"Aguardando a hora de envio... Hora atual: {hora_atual}")
-            time.sleep(60)
-            hora_atual = time.strftime("%H:%M")
+            rio_df = pd.concat(dfs, ignore_index=True)
+            logging.info(f"Total de focos de calor combinados antes da filtragem: {len(rio_df)}")
 
-def main():
-    # Obtendo o dia atual no formato YYYY-MM-DD
-    hoje = time.strftime("%Y-%m-%d")
-    logging.info(f"Hoje é: {hoje}")
-
-    # Let's set your map key that was emailed to you. It should look something like 'abcdef1234567890abcdef1234567890'
-    MAP_KEY = 'your_map_key_here'  # Substitua pelo seu MAP_KEY real
-
-    # now let's check how many transactions we have
-    url = 'https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY=' + MAP_KEY
-
-    try:
-        df = pd.read_json(url,  typ='series')
-    except:
-        logging.error("There is an issue with the query. \nTry in your browser: %s" % url)
-
-    def get_transaction_count() :
-        count = 0
-        try:
-            df = pd.read_json(url,  typ='series')
-            count = df['current_transactions']
-        except:
-            logging.error ("Error in our call.")
-        return count
-
-    try:
-        tcount = get_transaction_count()
-        logging.info ('Our current transaction count is %i' % tcount)
-        start_count = get_transaction_count()
-        end_count = get_transaction_count()
-
-        # URL para o Rio de Janeiro
-        rio_bbox = "-45.4,-23.6,-40.9,-20.7"
-
-        # --------------------------------------------- NOAA20 NRT ---------------------------------------------
-        noa_url = f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/VIIRS_NOAA20_NRT/{rio_bbox}/1'
-        rio_df_noa = pd.read_csv(noa_url)
-
-        # --------------------------------------------- NOAA21 NRT ---------------------------------------------
-        noaa_url = f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/VIIRS_NOAA21_NRT/{rio_bbox}/1'
-        rio_df_noaa = pd.read_csv(noaa_url)
-
-        # --------------------------------------------- MODIS NRT ---------------------------------------------
-        modis_url = f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/MODIS_NRT/{rio_bbox}/1'
-        rio_df_modis = pd.read_csv(modis_url)
-
-        # --------------------------------------------- S-NPP NRT ---------------------------------------------
-        snpp_url = f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/VIIRS_SNPP_NRT/{rio_bbox}/1'
-        rio_df_snpp = pd.read_csv(snpp_url)
-
-        # Junta todos os DataFrames em um só
-        rio_df = pd.concat([rio_df_noa, rio_df_noaa, rio_df_modis, rio_df_snpp], ignore_index=True)
-
-        # Carregue os dados de focos de calor (df_area) e das plantas industriais (df_industrias)
+        # Carrega os dados de indústrias a partir de um arquivo Excel.
         df_industrias = pd.read_excel('calor_fixo.xlsx')
-        df_industrias = df_industrias.replace(',', '.')
+        logging.info(f"Dados de indústrias carregados: {len(df_industrias)} registros.")
+
     except Exception as e:
-        logging.error(f"Erro ao carregar os dados: {e}")
+        logging.error(f"Erro crítico ao carregar os dados iniciais (FIRMS ou indústrias): {e}")
+        return
+
+    # Se nenhum foco de calor for encontrado, encerra a execução.
+    if rio_df.empty:
+        logging.info("DataFrame de focos de calor está vazio. Não há dados para processar.")
+        mensagem = f"Nenhum foco de calor encontrado hoje ({hoje}) no Rio de Janeiro após consulta inicial às fontes."
+        logging.info(mensagem)
+        return
 
     try:
-        # Adiciona uma coluna indicando se o foco está em indústria
+        # Filtra os focos para remover aqueles próximos a indústrias e manter apenas os do dia atual.
         rio_df['em_industria'] = rio_df.apply(lambda row: foco_em_industria(row, df_industrias), axis=1)
-        # Filtra apenas os focos em indústrias
-        focos_fixos = rio_df[rio_df['em_industria']]
-        # Filtra apenas os focos do dia de hoje e que NÃO são fixos
-        rio_df_hoje_sem_fixos = rio_df[(rio_df['acq_date'] == hoje) & (rio_df['em_industria'] != True)]
-        rio_shape = gpd.read_file(r'RJ_setores_CD2022\RJ_setores_CD2022.shp')
-        rio_shape = rio_shape.to_crs(epsg=4326)  # Converte para o sistema de coordenadas WGS84
-        # Converte rio_df_hoje_sem_fixos em GeoDataFrame
-        geometry = gpd.points_from_xy(rio_df_hoje_sem_fixos['longitude'], rio_df_hoje_sem_fixos['latitude'])
-        gdf_pontos = gpd.GeoDataFrame(rio_df_hoje_sem_fixos, geometry=geometry, crs="EPSG:4326")
-        # Faz o spatial join para adicionar o município correspondente
-        gdf_pontos = gpd.sjoin(gdf_pontos, rio_shape[['geometry', 'NM_MUN', 'NM_BAIRRO', 'NM_DIST']], how='inner', predicate='within')
-        # Renomeia a coluna NM_MUN para municipio
-        gdf_pontos = gdf_pontos.rename(columns={'NM_MUN': 'municipio', 'NM_BAIRRO': 'Bairro', 'NM_DIST': 'Distrito'})
-        # Remove colunas desnecessárias do join
-        gdf_pontos = gdf_pontos.drop(columns=['geometry', 'index_right'])
-        # Atualiza o DataFrame original
-        rio_df_hoje_sem_fixos = gdf_pontos.reset_index(drop=True)
-        rio_df_hoje_sem_fixos = rio_df_hoje_sem_fixos[['latitude', 'longitude', 'acq_date', 'acq_time', 'daynight', 'municipio' , 'Bairro', 'Distrito', 'satellite', 'instrument']]
-        # Converter o DataFrame em uma lista de dicionários
-        lista_dicts = rio_df_hoje_sem_fixos.to_dict(orient='records')
-        logging.info(lista_dicts)
-
-        mensagem = f"Focos de calor encontrados no Rio de Janeiro hoje ({hoje}):\n\n"
-        qt = len(rio_df_hoje_sem_fixos)
-        if qt == 0:
-            mensagem = "Nenhum foco de calor encontrado hoje no Rio de Janeiro."
+        rio_df_hoje_sem_fixos_pd = rio_df[(rio_df['acq_date'] == hoje) & (~rio_df['em_industria'])].copy()
+        
+        # Se não houver focos após a filtragem, encerra.
+        if rio_df_hoje_sem_fixos_pd.empty:
+            logging.info(f"Nenhum foco de calor encontrado para hoje ({hoje}) que não seja em indústria.")
+            mensagem = f"Nenhum foco de calor (excluindo áreas industriais) encontrado hoje ({hoje}) no Rio de Janeiro."
             logging.info(mensagem)
             return
-        for i in range(qt):
-            h = viirs_utc_to_brasilia(rio_df_hoje_sem_fixos.iloc[i]['acq_date'], rio_df_hoje_sem_fixos.iloc[i]['acq_time'])
-            mensagem += f"Foco {i+1}:\n"
-            mensagem += f"Latitude: {rio_df_hoje_sem_fixos.iloc[i]['latitude']}\n"
-            mensagem += f"Longitude: {rio_df_hoje_sem_fixos.iloc[i]['longitude']}\n"
-            mensagem += f"Data: {rio_df_hoje_sem_fixos.iloc[i]['acq_date']}\n"
-            mensagem += f"Hora: {h}\n"
-            if rio_df_hoje_sem_fixos.iloc[i]['daynight'] == 'D':
-                mensagem += f"Dia ou noite: Dia\n"
-            else:
-                mensagem += f"Dia ou noite: Noite\n"
-            mensagem += f"Municipio: {rio_df_hoje_sem_fixos.iloc[i]['municipio']}\n"
-            mensagem += f"Bairro: {rio_df_hoje_sem_fixos.iloc[i]['Bairro']}\n"
-            mensagem += f"Distrito: {rio_df_hoje_sem_fixos.iloc[i]['Distrito']}\n"
-            mensagem += f"Fonte: {rio_df_hoje_sem_fixos.iloc[i]['satellite']}, {rio_df_hoje_sem_fixos.iloc[i]['instrument']}\n\n"
-            print(mensagem)
+
+        logging.info(f"Focos para hoje ({hoje}) não industriais: {len(rio_df_hoje_sem_fixos_pd)}")
+
+        # Converte o DataFrame para um GeoDataFrame para análise espacial.
+        geometry = gpd.points_from_xy(rio_df_hoje_sem_fixos_pd['longitude'], rio_df_hoje_sem_fixos_pd['latitude'])
+        current_gdf = gpd.GeoDataFrame(
+            rio_df_hoje_sem_fixos_pd.reset_index(drop=True).reset_index().rename(columns={'index': 'original_id'}),
+            geometry=geometry,
+            crs="EPSG:4326"
+        )
+        logging.info(f"GeoDataFrame inicial criado com {len(current_gdf)} pontos.")
+
+        # Realiza um join espacial para identificar o município, bairro e distrito de cada foco.
+        rio_shape = gpd.read_file(r'RJ_setores_CD2022\RJ_setores_CD2022.shp')
+        rio_shape = rio_shape.to_crs(current_gdf.crs)
+        
+        current_gdf = gpd.sjoin(current_gdf, rio_shape[['geometry', 'NM_MUN', 'NM_BAIRRO', 'NM_DIST']], how='inner', predicate='within')
+        current_gdf = current_gdf.drop_duplicates(subset=['original_id'], keep='first')
+        current_gdf = current_gdf.rename(columns={'NM_MUN': 'municipio', 'NM_BAIRRO': 'Bairro', 'NM_DIST': 'Distrito'})
+        if 'index_right' in current_gdf.columns:
+            current_gdf = current_gdf.drop(columns=['index_right'])
+        return current_gdf
     except Exception as e:
-        logging.error(f"Erro durantes os filtros: {e}")
+        logging.error(f"Erro ao carregar ao montar os pontos de calor fora de zonas industriais")
+
+def prepara_ucs (ucs: list, trad:list)-> gpd.GeoDataFrame:
+    """
+    Recebe uma lista com dataframes com as UCs, filtra somente o nome e a geometria e retorna a junção.
+
+    Args:
+        ucs (list[gpd.GeoDataFrames]): Lista com os GeoDataFrames que precisam ter as colunas "nome" e "geometry"
+        trad (list): Lista no formato [{Nome da coluna que contém o nome antes do filtro},{Nome da coluna depois do filtro}]
+    Returns:
+        GeoDataFrame com todos os dataframes de entrada filtrados para somente 'nome' e 'geometry' concatenados
+    """
+    if(len(trad) != 2 or type(trad[0])!= str or type(trad[1])!= str):
+        print("Argumento de tradução incorreto")
+        return gpd.GeoDataFrame({})
+
+    verificar_conds = lambda uc : (type(uc) == gpd.GeoDataFrame) and (trad[0] in uc.columns) and ("geometry" in uc.columns)
+    
+    if(len(ucs) > 0 and all(list(map(verificar_conds,ucs)))):
+
+        filtro = lambda gdf : gdf[["geometry",trad[0]]].rename(columns={trad[0]:trad[1]})
+        x = map(filtro,ucs)
+
+        return pd.concat(list(x))
+    print("Lista incorreta")
+    return gpd.GeoDataFrame({})
+
+def detecta_foco(
+        current_gdf: gpd.GeoDataFrame,
+        UCs_municipais: gpd.GeoDataFrame, 
+        UCs_estaduais: gpd.GeoDataFrame,
+        ZAs: gpd.GeoDataFrame ) -> gpd.GeoDataFrame:  
+    """
+    Recebe as informações e retorna o geodataframe com as UCs que possuem focos de incêndio já formatado para formar as mensagens
+
+    Args:
+        current_gdf (GeoDataFrame): GeoDataFrame com os focos das indústrias;
+        UCs_municipais (GeoDataFrame): GeoDataFrame com as Unidades de conservação municipais;
+        UCs_estaduais (GeoDataFrame): GeoDataFrame com as Unidades de conservação estaduais;
+        ZAs (GeoDataFrame ou None): GeoDataFrame com as Zonas de amortecimento;
+
+    Returns:
+        rio_df_final_para_mensagem (GeoDataFrame): GeoDatFrame contendo Unidades de Conservação com focos de incêndio dentro
+    """
+
+    # Realiza joins espaciais para identificar se os focos estão em UCs ou ZAs.
+
+    uc_data_to_join = prepara_ucs([UCs_municipais,UCs_estaduais],['nome','Unidade de Conservação'])
+
+    current_gdf = gpd.sjoin(current_gdf, uc_data_to_join, how='left', predicate='within')
+    current_gdf = current_gdf.drop_duplicates(subset=['original_id'], keep='first')
+    if 'index_right' in current_gdf.columns:
+        current_gdf = current_gdf.drop(columns=['index_right'])
+    logging.info(f"Pontos após join com UCs (antes da filtragem final): {len(current_gdf)}")
+
+
+    za_data_to_join = prepara_ucs([ZAs],['Nome','Zona de Amortecimento'])
+
+    current_gdf = gpd.sjoin(current_gdf, za_data_to_join, how='left', predicate='within')
+    current_gdf = current_gdf.drop_duplicates(subset=['original_id'], keep='first')
+    if 'index_right' in current_gdf.columns:
+        current_gdf = current_gdf.drop(columns=['index_right'])
+    logging.info(f"Pontos após join com ZAs (antes da filtragem final): {len(current_gdf)}")
+
+
+    
+    # Filtra para manter apenas os focos que estão em UCs ou ZAs.
+    current_gdf = current_gdf[current_gdf['Unidade de Conservação'].notna() | current_gdf['Zona de Amortecimento'].notna()].copy()
+
+    if current_gdf.empty:
+        logging.info(f"Nenhum foco de calor encontrado em Unidades de Conservação ou Zonas de Amortecimento para hoje ({hoje}).")
+        mensagem = f"Nenhum foco de calor detectado em Unidades de Conservação ou Zonas de Amortecimento hoje ({hoje}) no Rio de Janeiro."
+        logging.info(mensagem)
+        return
+        
+    logging.info(f"Pontos finais após filtro de UC/ZA: {len(current_gdf)}")
+    
+    # Seleciona e formata as colunas finais para a mensagem de alerta.
+    colunas_finais_desejadas = [
+        'latitude', 'longitude', 'acq_date', 'acq_time', 'daynight',
+        'municipio', 'Bairro', 'Distrito', 'satellite', 'instrument',
+        'Unidade de Conservação', 'Zona de Amortecimento']
+    colunas_presentes = [col for col in colunas_finais_desejadas if col in current_gdf.columns] #Filtra do de indústria então tudo bem
+    rio_df_final_para_mensagem = current_gdf[colunas_presentes].reset_index(drop=True)
+    return rio_df_final_para_mensagem
+
+
+def main(hora):
+    """
+    Função principal que executa o processo de detecção e alerta de focos de calor.
+
+    Args:
+        hora (str): A hora agendada para o envio da mensagem de alerta (formato "HH:MM").
+    """
+
+    hoje = time.strftime("%Y-%m-%d")
+    logging.info(f"Hoje é: {hoje}")
+    enviar = hora
+    #hora_envio(enviar)
 
     try:
-        hora_envio()
-        formatar_mensagem(mensagem)
-        enviar_mensagem("Alerta focos")
-    except Exception as e:
-        logging.error(f"Erro durante a execução: {e}")
+        # Monta o GeoDataFrame com os pontos de calor fora de indústria no Rio de Janeiro
+        current_gdf = monta_pontos_de_calor()
+        if(current_gdf == None):
+            return
+        if current_gdf.empty:
+            logging.info(f"Nenhum foco de calor encontrado dentro dos limites municipais definidos no shapefile para hoje ({hoje}).")
+            return
+        logging.info(f"Pontos após join com municípios: {len(current_gdf)}")
+        
+        """Aqui o 'current_gdf' já começa a ser usado """
 
+        # Carrega os shapefiles de Unidades de Conservação (UCs) e Zonas de Amortecimento (ZAs).
+        UCs = gpd.read_file(r'UCs_ZAs\ucs_estaduais.shp')
+        ZAs = gpd.read_file(r'UCs_ZAs\gpl_ucs_estaduais_ZA.shp')
+        UCs = UCs.to_crs(current_gdf.crs)
+        ZAs = ZAs.to_crs(current_gdf.crs)
+
+        UCs_municipais = gpd.read_file(r'UCs_Municipais\GPL_UCS_MUN_2025_ME.shp')
+        UCs_municipais = UCs_municipais.to_crs(current_gdf.crs)
+
+        # Filtra as UC
+        rio_df_final_para_mensagem = detecta_foco(
+            current_gdf   = current_gdf,
+            UCs_estaduais = UCs,
+            UCs_municipais= UCs_municipais,
+            ZAs = ZAs)
+
+        lista_dicts = rio_df_final_para_mensagem.to_dict(orient='records')
+        logging.info("Dados finais dos focos (lista de dicionários):")
+        for item in lista_dicts:
+            logging.info(item)
+        
+        # Monta a mensagem de alerta com os detalhes de cada foco.
+        mensagem = f"Focos de calor encontrados no Rio de Janeiro hoje ({hoje}) em UCs ou ZAs:\n\n"
+        qt = len(rio_df_final_para_mensagem)
+        if qt == 0:
+            mensagem = f"Nenhum foco de calor encontrado hoje ({hoje}) no Rio de Janeiro em UCs ou ZAs após todas as filtragens."
+            logging.info(mensagem)
+            return
+
+        for i in range(qt):
+            ponto_atual = rio_df_final_para_mensagem.iloc[i]
+            h = viirs_utc_to_brasilia(ponto_atual['acq_date'], ponto_atual['acq_time'])
+            mensagem += f"Foco {i+1}:\n"
+            mensagem += f"  Latitude: {ponto_atual['latitude']}\n"
+            mensagem += f"  Longitude: {ponto_atual['longitude']}\n"
+            mensagem += f"  Data: {ponto_atual['acq_date']}\n"
+            mensagem += f"  Hora (Brasília): {h}\n"
+            mensagem += f"  Período: {'Dia' if ponto_atual['daynight'] == 'D' else 'Noite'}\n"
+            mensagem += f"  Município: {ponto_atual.get('municipio', 'N/A')}\n"
+            if pd.notna(ponto_atual.get('Bairro')):
+                mensagem += f"  Bairro: {ponto_atual['Bairro']}\n"
+            if pd.notna(ponto_atual.get('Distrito')):
+                mensagem += f"  Distrito: {ponto_atual['Distrito']}\n"
+            if 'Unidade de Conservação' in ponto_atual and pd.notna(ponto_atual['Unidade de Conservação']):
+                mensagem += f"  Unidade de Conservação: {ponto_atual['Unidade de Conservação']}\n"
+            if 'Zona de Amortecimento' in ponto_atual and pd.notna(ponto_atual['Zona de Amortecimento']):
+                mensagem += f"  Zona de Amortecimento: {ponto_atual['Zona de Amortecimento']}\n"
+            mensagem += f"  Fonte: {ponto_atual.get('satellite', 'N/A')}, {ponto_atual.get('instrument', 'N/A')}\n\n"
+
+        print("--- MENSAGEM GERADA ---")
+        print(mensagem)
+        print("-----------------------")
+
+        try:
+            # Verifica se uma mensagem idêntica já foi enviada hoje para evitar duplicatas.
+            dia, ultimos_focos = carregar_estado()
+            if dia == hoje and ultimos_focos == qt:
+                logging.info(f"Já foi enviada uma mensagem hoje ({hoje}) com {qt} focos. Aguardando novas detecções.")
+                return
+        except Exception as e:
+            logging.error(f"Erro durante o carregamento do arquivo de estado: {e}")
+        try:
+            
+            # Envia a mensagem via WhatsApp e salva o estado do envio.
+            
+            #enviar_mensagem(TOKEN, GRUPO, mensagem)
+            #salvar_estado(hoje, qt)
+            logging.info("Processo de alerta concluído e mensagem enviada.")
+        except Exception as e:
+            logging.error(f"Erro durante o agendamento ou envio da mensagem: {e}")
+    except Exception as e:
+        logging.error(f"Erro durante o processamento geoespacial ou geração da mensagem: {e}", exc_info=True)
+
+
+
+# Execução principal do script, agendada para horários específicos.
+# A função main é chamada para cada horário definido.
 try:
-    main()
+    main('07:00')
 except Exception as e:
-    logging.error(f"Erro durante a execução: {e}")
+    logging.error(f"Erro fatal na execução do script principal: {e}", exc_info=True)
+try:
+    main('10:30')
+except Exception as e:
+    logging.error(f"Erro fatal na execução do script principal: {e}", exc_info=True)
+try:
+    main('16:00')
+except Exception as e:
+    logging.error(f"Erro fatal na execução do script principal: {e}", exc_info=True)
+try:
+    main('17:00')
+except Exception as e:
+    logging.error(f"Erro fatal na execução do script principal: {e}", exc_info=True)

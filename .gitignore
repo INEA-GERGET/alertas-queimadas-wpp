@@ -1,0 +1,14 @@
+#Configurações
+config/config.ini
+config/mensagens_enviadas.json
+
+#Python
+__pycache__/
+
+#Logs
+logs/execucao.log
+
+# GeoDataBases -> Devem ser buscadas no portal GEOINEA
+UCs_Municipais/*
+UCs_ZAs/*
+RJ_setores_CD2022/*
